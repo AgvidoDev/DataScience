@@ -1,6 +1,6 @@
-# Полное руководство по внедрению Data Science & Machine Learning в оптовой компании сантехники
+# Полное руководство по внедрению Data Science & Machine Learning в компании Иберис Групп
 
-> Контекст: 2 собственных бренда, производство: Китай/Россия/Европа, продажи — только по РФ через партнёров (розничные магазины, интернет‑магазины, маркетплейсы; ≤5% — комплектовщики, дизайн‑студии, строители). Компания не ведёт прямую розницу. Компания регулирует РРЦ (минимальные/рекомендованные розничные цены).
+> Контекст: "Итальянские" бренды Cezares и BelBagno, производство: Китай/Россия/Европа, продажи — только по РФ через партнёров (розничные магазины, интернет‑магазины, маркетплейсы; ≤5% — комплектовщики, дизайн‑студии, строители). Компания не ведёт прямую розницу. Компания регулирует РРЦ (минимальные/рекомендованные розничные цены).
 
 ---
 
@@ -288,6 +288,240 @@
 
 
 ---
+
+
+## Приложение A. Примеры схем таблиц (DDL) и SQL
+
+### A1. Справочники (Dimensions)
+```sql
+-- Товары
+CREATE TABLE dim_product (
+  product_id        BIGINT PRIMARY KEY,
+  sku               TEXT NOT NULL UNIQUE,
+  brand_id          BIGINT NOT NULL,
+  series_id         BIGINT,
+  category          TEXT,
+  name              TEXT,
+  material          TEXT,
+  color             TEXT,
+  country_of_origin TEXT,
+  gtin              TEXT,
+  package_dims_mm   TEXT,
+  created_at        TIMESTAMP,
+  valid_from        DATE NOT NULL,
+  valid_to          DATE,
+  is_current        BOOLEAN DEFAULT TRUE
+);
+
+-- Партнёры
+CREATE TABLE dim_partner (
+  partner_id   BIGINT PRIMARY KEY,
+  inn          TEXT,
+  kpp          TEXT,
+  name         TEXT,
+  channel      TEXT CHECK (channel IN ('retail','ecom','marketplace','assembler','design','construction')),
+  region       TEXT,
+  type         TEXT,
+  created_at   TIMESTAMP
+);
+
+-- Прайс-лист/РРЦ (SCD2)
+CREATE TABLE dim_price (
+  price_id     BIGINT PRIMARY KEY,
+  product_id   BIGINT REFERENCES dim_product(product_id),
+  rrc          NUMERIC(12,2), -- РРЦ
+  wholesale    NUMERIC(12,2),
+  currency     TEXT,
+  valid_from   DATE NOT NULL,
+  valid_to     DATE,
+  is_current   BOOLEAN DEFAULT TRUE
+);
+```
+
+### A2. Факты (Facts)
+```sql
+-- Продажи/отгрузки (гранулярность: позиция заказа)
+CREATE TABLE fct_sales (
+  sales_id     BIGSERIAL PRIMARY KEY,
+  order_dt     DATE NOT NULL,
+  partner_id   BIGINT REFERENCES dim_partner(partner_id),
+  product_id   BIGINT REFERENCES dim_product(product_id),
+  qty          NUMERIC(12,3) NOT NULL,
+  net_price    NUMERIC(12,2) NOT NULL,
+  discount     NUMERIC(12,2) DEFAULT 0,
+  promo_flag   BOOLEAN DEFAULT FALSE,
+  region       TEXT,
+  channel      TEXT,
+  returned_qty NUMERIC(12,3) DEFAULT 0
+);
+
+-- Ежедневные остатки
+CREATE TABLE fct_inventory_daily (
+  snapshot_dt DATE NOT NULL,
+  product_id  BIGINT REFERENCES dim_product(product_id),
+  warehouse   TEXT,
+  on_hand_qty NUMERIC(12,3),
+  reserved_qty NUMERIC(12,3) DEFAULT 0,
+  aging_bucket TEXT,
+  PRIMARY KEY (snapshot_dt, product_id, warehouse)
+);
+
+-- Наблюдаемые цены с рынка/MP
+CREATE TABLE fct_prices_observed (
+  observed_dt DATE NOT NULL,
+  product_id  BIGINT REFERENCES dim_product(product_id),
+  partner_id  BIGINT REFERENCES dim_partner(partner_id),
+  listed_price NUMERIC(12,2) NOT NULL,
+  currency    TEXT,
+  promo_notes TEXT,
+  source      TEXT,
+  PRIMARY KEY (observed_dt, product_id, partner_id)
+);
+
+-- Отзывы
+CREATE TABLE fct_reviews (
+  review_id   BIGSERIAL PRIMARY KEY,
+  review_dt   TIMESTAMP,
+  product_id  BIGINT REFERENCES dim_product(product_id),
+  source      TEXT,
+  rating      INT CHECK (rating BETWEEN 1 AND 5),
+  text        TEXT,
+  sentiment   NUMERIC(5,2), -- после NLP
+  topics      TEXT[]
+);
+```
+
+### A3. Примеры аналитических запросов (SQL)
+```sql
+-- 1) Месячные продажи по SKU×регион с маржой
+SELECT date_trunc('month', order_dt) AS month,
+       p.sku,
+       s.region,
+       SUM(s.qty) AS units,
+       SUM(s.qty * s.net_price) AS revenue
+FROM fct_sales s
+JOIN dim_product p ON p.product_id = s.product_id
+GROUP BY 1,2,3
+ORDER BY 1,2,3;
+
+-- 2) Признак оттока партнёра: нет закупок > X дней
+WITH last_buy AS (
+  SELECT partner_id, MAX(order_dt) AS last_dt
+  FROM fct_sales
+  GROUP BY partner_id
+)
+SELECT d.partner_id,
+       (CURRENT_DATE - l.last_dt) > INTERVAL '60 days' AS is_churn
+FROM dim_partner d
+LEFT JOIN last_buy l USING(partner_id);
+
+-- 3) Выявление подозрения на нарушение РРЦ
+SELECT o.observed_dt, p.sku, pr.rrc, o.listed_price,
+       (o.listed_price < pr.rrc * 0.98) AS rrc_violation
+FROM fct_prices_observed o
+JOIN dim_product p USING(product_id)
+JOIN dim_price pr ON pr.product_id = o.product_id AND pr.is_current
+WHERE o.observed_dt = CURRENT_DATE;
+```
+
+---
+
+## Приложение B. Псевдокод ключевых ML‑моделей
+
+### B1. Прогнозирование спроса (SKU×регион)
+```python
+# Input: fct_sales, экзогенные признаки (цены, промо, праздники), частота = неделя
+for series in all_series(SKU, region):
+    y = build_time_series(series)
+    X = build_exogenous(series, price, promo, holidays, channel)
+    # baseline
+    model1 = Prophet().fit(y, X)
+    # gradient boosting
+    model2 = LightGBM().fit(lagged_features(y), X)
+    # ансамбль
+    yhat1 = model1.predict(h=12, X_future)
+    yhat2 = model2.predict(h=12, X_future)
+    yhat = 0.5*yhat1 + 0.5*yhat2
+    save_forecast(series, quantiles(yhat, p=[0.5, 0.9]))
+```
+
+### B2. Прогноз lead time поставки
+```python
+# Обучаем регрессию по маршруту, сезону, фабрике, порту, инкотермс
+features = [factory, port_origin, port_dest, month, incoterms, container_load]
+model = CatBoostRegressor().fit(features, actual_lead_time)
+lt_p50, lt_p90 = predict_quantiles(model, features_new)
+```
+
+### B3. Churn prediction партнёров
+```python
+X = features(RFM, trend_by_category, share_of_wallet, SLA_shipments, RRC_violations,
+             support_tickets, price_changes)
+y = label_churn(no_orders_for > k * median_cycle(partner))
+model = CatBoostClassifier().fit(X_train, y_train)
+proba = model.predict_proba(X_score)
+alerts = select_top_k_by_gain(proba, k=500)
+```
+
+### B4. Рекомендательная система B2B (ALS + правила)
+```python
+R = build_partner_sku_matrix(qty or revenue)
+als = ImplicitALS().fit(R)
+rec_als = als.recommend(partner_id, N=20, filters=in_stock & price_tier)
+assoc = association_rules(min_support=0.01, min_conf=0.2)
+rec_assoc = next_best_items(cart)
+recommendations = blend(rec_als, rec_assoc, weights=[0.7, 0.3])
+```
+
+### B5. Мониторинг нарушений РРЦ (классификатор)
+```python
+X = features(price_gap_to_rrc, promo_flag, coupon_detected, seller_rating,
+             history_of_violations, competitor_pressure)
+y = is_true_violation(labelled)
+model = XGBoostClassifier().fit(X, y)
+score = model.predict_proba(X_today)
+create_alerts(score > threshold_by_impact)
+```
+
+---
+
+## Приложение C. Чек‑лист внедрения на 90 дней
+
+### Недели 1–2
+- Утвердить бизнес‑KPI и владельцев метрик.
+- Провести аудит источников (ERP/CRM/WMS/маркетплейсы), зафиксировать схемы и доступы.
+- Определить уникальные ID (SKU, партнёр) и MDM‑правила.
+
+### Недели 3–4
+- Поднять DWH (staging) и настроить ежедневные загрузки продаж/остатков/прайсов.
+- Сформировать первые BI‑дашборды: продажи, остатки, ABC/XYZ.
+- Начать RFM‑сегментацию партнёров (эвристики).
+
+### Недели 5–6
+- Завести витрины для прогнозов (sales_weekly, prices, holidays).
+- MVP прогноза спроса по A‑категориям (baseline + backtest WAPE).
+- Подготовить фичи churn v0 и метрику оттока.
+
+### Недели 7–8
+- Развернуть MLflow, настроить трекинг экспериментов.
+- MVP churn‑модели (логистическая/CatBoost), выгрузка топ‑рисков в CRM.
+- Начать сбор данных о ценах с MP, первичная валидация РРЦ‑кейсов.
+
+### Недели 9–10
+- Витрина рекомендаций (partner×sku матрица). Пилот ALS для 10–20 ключевых партнёров.
+- Настроить алерты: падение продаж по A‑SKU, OOS‑риск, нарушения РРЦ.
+
+### Недели 11–12
+- Ретроспективный S&OP: сравнение прогнозов P50/P90 vs факт, корректировки.
+- Подготовить план масштабирования (склады, фабрики, MP) и Roadmap на 6–12 мес.
+- Презентация результатов и следующих шагов.
+
+**Критерии успеха 90 дней**
+- BI в проде, SLA загрузок ≥ 99%.
+- Прогноз A‑SKU WAPE ≤ 25–30% (MVP).
+- Топ‑лист партнёров риска оттока и первые win‑back кейсы.
+- Запущены алерты OOS/РРЦ, устранены первые нарушения.
+```
 
 ### Итог
 Гайд выше — это полный каркас внедрения DS/ML под специфику оптовой сантехники с брендами и РРЦ: от данных и моделей до процессов, команды и экономического эффекта. Его можно разворачивать по этапам 36‑месячной дорожной карты, начиная с быстрых побед (BI, RFM, ABC/XYZ) и двигаясь к прогнозам, рекомендациям, оптимизации запасов и ценообразованию в рамках РРЦ.
