@@ -39,7 +39,7 @@ markdown
 
 ### 1) `docker` — Показать все доступные команды Docker
 
-```bash
+bash
 docker [опция] [команда] [аргументы]
 ### 2) docker version — Показать версию Docker
 bash
